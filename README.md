@@ -1,6 +1,8 @@
 # ICMP文件传输工具使用指南
 
+
 ## 概述
+![image](https://github.com/user-attachments/assets/ea285fe5-736d-4b72-bd75-efbf78c7484c)
 
 这是一个基于ICMP协议的跨局域网文件传输工具，通过伪装成ping包来穿透网络防火墙，实现文件的可靠传输。
 

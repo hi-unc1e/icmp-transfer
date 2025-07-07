@@ -1,454 +1,528 @@
 package main
 
 import (
-	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
 
-// --- 1. Custom Application Layer Protocol Header ---
+// 协议常量
 const (
-	// Message Types
-	MsgTypeData  uint8 = 0x01
-	MsgTypeACK   uint8 = 0x02
-	MsgTypeStart uint8 = 0x03
-	MsgTypeEnd   uint8 = 0x04
-
-	// Max payload size to fit within common MTU, considering ICMP header (8 bytes)
-	// ICMP Data = IP Packet Size - IP Header (20B) - ICMP Header (8B)
-	// For a 1500 byte network MTU, IP Packet Size = 1500
-	// Max ICMP Data = 1500 - 20 - 8 = 1472 bytes.
-	// We'll use your suggested 1200 bytes for payload + 11 bytes for custom header = 1211 total.
-	// This fits comfortably.
-	//MaxPayloadSize = 1200
-	HeaderSize = 1 + 4 + 2 + 2 + 2 // Type + SessionID + FragmentID + TotalFragments + Checksum
+	MaxPayloadSize = 1200
+	WindowSize     = 32
+	DefaultTimeout = 5 * time.Second
+	MaxRetries     = 3
+	ICMPProtocol   = 1
 )
 
-// CustomHeader defines the structure of our application-layer header within the ICMP payload.
-type CustomHeader struct {
-	Type           uint8
-	SessionID      uint32
-	FragmentID     uint16
-	TotalFragments uint16
-	Checksum       uint16 // CRC16 of the Payload
+// 消息类型
+const (
+	MsgTypeData  = 0x01
+	MsgTypeACK   = 0x02
+	MsgTypeStart = 0x03
+	MsgTypeEnd   = 0x04
+)
+
+// ICMP协议头
+type ICMPHeader struct {
+	Type      uint8
+	SessionID uint32
+	SeqID     uint16
+	TotalSeq  uint16
+	Checksum  uint16
+	Length    uint16
 }
 
-// ICMPPacket represents our full custom ICMP packet structure (header + payload).
-type ICMPPacket struct {
-	Header  CustomHeader
-	Payload []byte
+// 序列化协议头
+func (h *ICMPHeader) Marshal() []byte {
+	buf := make([]byte, 13)
+	buf[0] = h.Type
+	binary.BigEndian.PutUint32(buf[1:5], h.SessionID)
+	binary.BigEndian.PutUint16(buf[5:7], h.SeqID)
+	binary.BigEndian.PutUint16(buf[7:9], h.TotalSeq)
+	binary.BigEndian.PutUint16(buf[9:11], h.Checksum)
+	binary.BigEndian.PutUint16(buf[11:13], h.Length)
+	return buf
 }
 
-// Marshal converts the ICMPPacket into a byte slice for transmission.
-func (p *ICMPPacket) Marshal() ([]byte, error) {
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, p.Header.Type); err != nil {
-		return nil, err
+// 反序列化协议头
+func UnmarshalICMPHeader(data []byte) *ICMPHeader {
+	if len(data) < 13 {
+		return nil
 	}
-	if err := binary.Write(buf, binary.BigEndian, p.Header.SessionID); err != nil {
-		return nil, err
+	return &ICMPHeader{
+		Type:      data[0],
+		SessionID: binary.BigEndian.Uint32(data[1:5]),
+		SeqID:     binary.BigEndian.Uint16(data[5:7]),
+		TotalSeq:  binary.BigEndian.Uint16(data[7:9]),
+		Checksum:  binary.BigEndian.Uint16(data[9:11]),
+		Length:    binary.BigEndian.Uint16(data[11:13]),
 	}
-	if err := binary.Write(buf, binary.BigEndian, p.Header.FragmentID); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, p.Header.TotalFragments); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, p.Header.Checksum); err != nil {
-		return nil, err
-	}
-	buf.Write(p.Payload)
-	return buf.Bytes(), nil
 }
 
-// Unmarshal parses a byte slice into an ICMPPacket.
-func (p *ICMPPacket) Unmarshal(data []byte) error {
-	if len(data) < HeaderSize {
-		return fmt.Errorf("data too short for custom header")
-	}
-
-	reader := bytes.NewReader(data)
-	if err := binary.Read(reader, binary.BigEndian, &p.Header.Type); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &p.Header.SessionID); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &p.Header.FragmentID); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &p.Header.TotalFragments); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &p.Header.Checksum); err != nil {
-		return err
-	}
-
-	p.Payload = data[HeaderSize:]
-	return nil
+// 计算校验和
+func calculateChecksum(data []byte) uint16 {
+	return uint16(crc32.ChecksumIEEE(data) & 0xFFFF)
 }
 
-// calculateCRC16 calculates CRC-16 (CCITT) checksum for the given data.
-func calculateCRC16(data []byte) uint16 {
-	// Using IEEE CRC32 for simplicity here, as Go's standard lib doesn't have CRC16 directly.
-	// For production, you'd use a dedicated CRC16 implementation (e.g., github.com/sigurn/crc16)
-	// or implement it manually. CRC32 provides stronger integrity checking anyway.
-	return uint16(crc32.ChecksumIEEE(data))
+// 传输会话
+type Session struct {
+	ID         uint32
+	Window     [WindowSize]bool
+	Acked      uint16
+	LastSeq    uint16
+	DataBuffer map[uint16][]byte
+	File       *os.File
+	Lock       sync.Mutex
+	TotalSeq   uint16
+	Filename   string
 }
 
-// --- 2. Client Design (Simplified Send) ---
-
+// 客户端
 type Client struct {
 	ServerIP  net.IP
-	Conn      *icmp.PacketConn
-	SessionID uint32 // Unique for each file transfer session
-	Timeout   time.Duration
+	SessionID uint32
 	Retry     int
-	// You'd add channels for ACK handling, progress, etc.
+	Timeout   time.Duration
+	conn      net.Conn
+	Progress  *progressbar.ProgressBar
 }
 
-// NewClient creates a new ICMP client.
+// 创建客户端
 func NewClient(serverIP string) (*Client, error) {
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0") // Listen on all interfaces for ICMP
+	ip := net.ParseIP(serverIP)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid server IP: %s", serverIP)
+	}
+
+	// 生成随机会话ID
+	sessionBytes := make([]byte, 4)
+	rand.Read(sessionBytes)
+	sessionID := binary.BigEndian.Uint32(sessionBytes)
+
+	// 创建ICMP连接
+	conn, err := net.Dial("ip4:icmp", serverIP)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen for ICMP: %w", err)
+		return nil, fmt.Errorf("failed to create ICMP connection: %v", err)
 	}
 
 	return &Client{
-		ServerIP:  net.ParseIP(serverIP),
-		Conn:      conn,
-		SessionID: generateSessionID(), // A simple example, use a cryptographically strong one
-		Timeout:   3 * time.Second,
-		Retry:     3,
+		ServerIP:  ip,
+		SessionID: sessionID,
+		Retry:     MaxRetries,
+		Timeout:   DefaultTimeout,
+		conn:      conn,
 	}, nil
 }
 
-// Close closes the ICMP connection.
-func (c *Client) Close() {
-	if c.Conn != nil {
-		if err := c.Conn.Close(); err != nil {
-			log.Printf("[Client] Error closing ICMP connection: %v\n", err)
-		}
-	}
-}
-
-// generateSessionID generates a pseudo-random session ID.
-// In a real application, this should be cryptographically secure.
-func generateSessionID() uint32 {
-	return uint32(time.Now().UnixNano()) // Very simple for example
-}
-
-// SendDataPacket sends a single data packet and waits for an ACK.
-// This is a highly simplified version without sliding window or file splitting.
-func (c *Client) SendDataPacket(fragmentID uint16, totalFragments uint16, data []byte) error {
-	header := CustomHeader{
-		Type:           MsgTypeData,
-		SessionID:      c.SessionID,
-		FragmentID:     fragmentID,
-		TotalFragments: totalFragments,
-		Checksum:       calculateCRC16(data),
-	}
-	pkt := ICMPPacket{Header: header, Payload: data}
-	msgBytes, err := pkt.Marshal()
+// 发送文件
+func (c *Client) SendFile(filePath string) error {
+	// 打开文件
+	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to marshal packet: %w", err)
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	// 获取文件信息
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %v", err)
 	}
 
-	// Create an ICMP echo request message.
-	// Type 8 is Echo Request for IPv4. Code 0 is standard.
-	// ID and Seq are typically used by ping, but we can use them
-	// for our own purposes or just set them to 0.
-	// We put our custom protocol message into the Data field of the ICMP message.
-	icmpMsg := icmp.Message{
-		Type: ipv4.ICMPTypeEcho, Code: 0,
+	fileSize := fileInfo.Size()
+	filename := filepath.Base(filePath)
+
+	// 计算总分片数
+	totalChunks := int((fileSize + MaxPayloadSize - 1) / MaxPayloadSize)
+
+	// 创建进度条
+	c.Progress = progressbar.NewOptions64(
+		fileSize,
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetDescription(fmt.Sprintf("Sending %s", filename)),
+	)
+
+	// 发送开始包
+	err = c.sendStartPacket(filename, uint16(totalChunks))
+	if err != nil {
+		return fmt.Errorf("failed to send start packet: %v", err)
+	}
+
+	// 发送文件数据
+	buffer := make([]byte, MaxPayloadSize)
+	for seqID := uint16(1); seqID <= uint16(totalChunks); seqID++ {
+		n, err := file.Read(buffer)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read file: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// 发送数据包
+		err = c.sendDataPacket(seqID, uint16(totalChunks), buffer[:n])
+		if err != nil {
+			return fmt.Errorf("failed to send data packet %d: %v", seqID, err)
+		}
+
+		// 更新进度
+		c.Progress.Add(n)
+	}
+
+	// 发送结束包
+	err = c.sendEndPacket(uint16(totalChunks))
+	if err != nil {
+		return fmt.Errorf("failed to send end packet: %v", err)
+	}
+
+	c.Progress.Finish()
+	fmt.Printf("\nFile %s sent successfully!\n", filename)
+	return nil
+}
+
+// 发送开始包
+func (c *Client) sendStartPacket(filename string, totalSeq uint16) error {
+	header := &ICMPHeader{
+		Type:      MsgTypeStart,
+		SessionID: c.SessionID,
+		SeqID:     0,
+		TotalSeq:  totalSeq,
+		Length:    uint16(len(filename)),
+	}
+
+	payload := []byte(filename)
+	header.Checksum = calculateChecksum(payload)
+
+	return c.sendPacket(header, payload)
+}
+
+// 发送数据包
+func (c *Client) sendDataPacket(seqID, totalSeq uint16, data []byte) error {
+	header := &ICMPHeader{
+		Type:      MsgTypeData,
+		SessionID: c.SessionID,
+		SeqID:     seqID,
+		TotalSeq:  totalSeq,
+		Length:    uint16(len(data)),
+	}
+
+	header.Checksum = calculateChecksum(data)
+
+	return c.sendPacket(header, data)
+}
+
+// 发送结束包
+func (c *Client) sendEndPacket(totalSeq uint16) error {
+	header := &ICMPHeader{
+		Type:      MsgTypeEnd,
+		SessionID: c.SessionID,
+		SeqID:     totalSeq + 1,
+		TotalSeq:  totalSeq,
+		Length:    0,
+	}
+
+	return c.sendPacket(header, nil)
+}
+
+// 发送数据包
+func (c *Client) sendPacket(header *ICMPHeader, payload []byte) error {
+	headerBytes := header.Marshal()
+
+	// 构造ICMP消息
+	msg := &icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Code: 0,
 		Body: &icmp.Echo{
-			ID: os.Getpid() & 0xffff, Seq: int(fragmentID), // Use fragmentID as sequence for clarity
-			Data: msgBytes,
+			ID:   int(c.SessionID & 0xFFFF),
+			Seq:  int(header.SeqID),
+			Data: append(headerBytes, payload...),
 		},
 	}
-	icmpMsgBytes, err := icmpMsg.Marshal(nil)
+
+	msgBytes, err := msg.Marshal(nil)
 	if err != nil {
-		return fmt.Errorf("failed to marshal ICMP message: %w", err)
+		return fmt.Errorf("failed to marshal ICMP message: %v", err)
 	}
 
-	peerAddr := &net.IPAddr{IP: c.ServerIP}
-
-	// --- 3. Reliability: Basic Retry Mechanism ---
-	for i := 0; i < c.Retry; i++ {
-		log.Printf("[Client] Sending fragment %d (session %d)... attempt %d/%d\n",
-			fragmentID, c.SessionID, i+1, c.Retry)
-
-		_, err = c.Conn.WriteTo(icmpMsgBytes, peerAddr)
-		if err != nil {
-			log.Printf("[Client] Error sending packet: %v\n", err)
-			continue
-		}
-
-		// Wait for ACK
-		ackReceived := make(chan bool, 1)
-		go func() {
-			readBuf := make([]byte, 1500) // Max possible ICMP packet size
-			err := c.Conn.SetReadDeadline(time.Now().Add(c.Timeout))
-			if err != nil {
-				return
-			}
-			n, peer, err := c.Conn.ReadFrom(readBuf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					return // Timeout
-				}
-				log.Printf("[Client] Error reading response: %v\n", err)
-				return
-			}
-
-			if peer.String() != peerAddr.String() {
-				log.Printf("[Client] Received packet from unexpected peer: %s\n", peer.String())
-				return
-			}
-
-			parsedMsg, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), readBuf[:n])
-			if err != nil {
-				log.Printf("[Client] Error parsing ICMP reply: %v\n", err)
-				return
-			}
-
-			if parsedMsg.Type == ipv4.ICMPTypeEchoReply {
-				echoReply, ok := parsedMsg.Body.(*icmp.Echo)
-				if !ok {
-					log.Printf("[Client] Received non-echo reply body\n")
-					return
-				}
-
-				// Unmarshal our custom header from the Echo Reply Data field
-				var ackPkt ICMPPacket
-				if err := ackPkt.Unmarshal(echoReply.Data); err != nil {
-					log.Printf("[Client] Error unmarshaling ACK packet: %v\n", err)
-					return
-				}
-
-				// Check if it's an ACK for our session and fragment
-				if ackPkt.Header.Type == MsgTypeACK &&
-					ackPkt.Header.SessionID == c.SessionID &&
-					ackPkt.Header.FragmentID == fragmentID {
-					log.Printf("[Client] Received ACK for fragment %d (session %d)\n", fragmentID, c.SessionID)
-					ackReceived <- true
-					return
-				}
-			}
-		}()
-
-		select {
-		case <-ackReceived:
-			return nil // ACK received, success
-		case <-time.After(c.Timeout):
-			log.Printf("[Client] Timeout waiting for ACK for fragment %d\n", fragmentID)
-		}
+	// 发送数据包
+	_, err = c.conn.Write(msgBytes)
+	if err != nil {
+		return fmt.Errorf("failed to write to connection: %v", err)
 	}
 
-	return fmt.Errorf("failed to send fragment %d after %d retries", fragmentID, c.Retry)
+	return nil
 }
 
-// --- 3. Server Design (Simplified Receive and ACK) ---
+// 关闭连接
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
 
+// 服务端
 type Server struct {
-	Conn       *icmp.PacketConn
 	StorageDir string
-	Sessions   sync.Map // map[uint32]*Session (Session would hold file buffer, progress, etc.)
-	// You'd add a workers pool, progress map, etc.
+	Sessions   sync.Map
+	conn       *icmp.PacketConn
 }
 
-// NewServer creates a new ICMP server.
+// 创建服务端
 func NewServer(storageDir string) (*Server, error) {
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0") // Listen on all interfaces for ICMP
+	// 创建存储目录
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create storage directory: %v", err)
+	}
+
+	// 监听ICMP连接
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen for ICMP: %w", err)
+		return nil, fmt.Errorf("failed to listen on ICMP: %v", err)
 	}
 
 	return &Server{
-		Conn:       conn,
 		StorageDir: storageDir,
+		conn:       conn,
 	}, nil
 }
 
-// Start listens for incoming ICMP packets and processes them.
-func (s *Server) Start() {
-	log.Println("[Server] Listening for ICMP packets...")
-	readBuf := make([]byte, 1500) // Max possible ICMP packet size
+// 启动服务器
+func (s *Server) Start() error {
+	fmt.Printf("ICMP server started, listening on all interfaces\n")
+	fmt.Printf("Storage directory: %s\n", s.StorageDir)
 
+	buffer := make([]byte, 1500)
 	for {
-		n, peer, err := s.Conn.ReadFrom(readBuf)
+		n, peer, err := s.conn.ReadFrom(buffer)
 		if err != nil {
-			log.Printf("[Server] Error reading packet: %v\n", err)
+			log.Printf("Error reading from connection: %v", err)
 			continue
 		}
 
-		go s.handlePacket(readBuf[:n], peer) // Handle concurrently
+		// 解析ICMP消息
+		protoNum := ipv4.ICMPTypeEchoReply.Protocol()
+		msg, err := icmp.ParseMessage(protoNum, buffer[:n])
+		if err != nil {
+			continue
+		}
+
+		// 处理Echo消息
+		if echo, ok := msg.Body.(*icmp.Echo); ok {
+			go s.handlePacket(echo.Data, peer)
+		}
 	}
 }
 
-// handlePacket processes a single incoming ICMP packet.
-func (s *Server) handlePacket(pktBytes []byte, peer net.Addr) {
-	// Parse the incoming ICMP message
-	msg, err := icmp.ParseMessage(ipv4.ICMPTypeEcho.Protocol(), pktBytes)
-	if err != nil {
-		log.Printf("[Server] Error parsing ICMP message from %s: %v\n", peer.String(), err)
+// 处理数据包
+func (s *Server) handlePacket(data []byte, peer net.Addr) {
+	if len(data) < 13 {
 		return
 	}
 
-	// We expect an Echo Request from the client
-	if msg.Type != ipv4.ICMPTypeEcho {
-		log.Printf("[Server] Received non-echo request ICMP type %d from %s\n", msg.Type, peer.String())
+	header := UnmarshalICMPHeader(data)
+	if header == nil {
 		return
 	}
 
-	echoReq, ok := msg.Body.(*icmp.Echo)
-	if !ok {
-		log.Printf("[Server] Received ICMP Echo with non-Echo body from %s\n", peer.String())
+	payload := data[13:]
+	if len(payload) != int(header.Length) {
 		return
 	}
 
-	// Unmarshal our custom protocol header from the ICMP Echo Data
-	var customPkt ICMPPacket
-	if err := customPkt.Unmarshal(echoReq.Data); err != nil {
-		log.Printf("[Server] Error unmarshaling custom packet from %s: %v\n", peer.String(), err)
+	// 验证校验和
+	if header.Checksum != calculateChecksum(payload) {
+		log.Printf("Checksum mismatch for session %d, seq %d", header.SessionID, header.SeqID)
 		return
 	}
 
-	log.Printf("[Server] Received custom packet (Type: %d, Session: %d, Fragment: %d/%d) from %s\n",
-		customPkt.Header.Type, customPkt.Header.SessionID,
-		customPkt.Header.FragmentID, customPkt.Header.TotalFragments, peer.String())
-
-	// Validate checksum
-	if customPkt.Header.Checksum != calculateCRC16(customPkt.Payload) {
-		log.Printf("[Server] Checksum mismatch for fragment %d (session %d) from %s\n",
-			customPkt.Header.FragmentID, customPkt.Header.SessionID, peer.String())
-		// In a real scenario, you might NACK or just drop and let client retransmit
-		return
-	}
-
-	// Process based on custom packet type
-	switch customPkt.Header.Type {
+	switch header.Type {
 	case MsgTypeStart:
-		log.Printf("[Server] Handle START message for session %d\n", customPkt.Header.SessionID)
-		// TODO: Initialize session, create file, etc.
-		s.sendACK(customPkt.Header.SessionID, 0, peer, echoReq.ID, echoReq.Seq) // ACK fragment 0 (Start)
+		s.handleStartPacket(header, payload, peer)
 	case MsgTypeData:
-		log.Printf("[Server] Handle DATA message for session %d, fragment %d. Payload size: %d bytes\n",
-			customPkt.Header.SessionID, customPkt.Header.FragmentID, len(customPkt.Payload))
-		// TODO: Store fragment, manage sliding window.
-		// For this example, just acknowledge receipt.
-		s.sendACK(customPkt.Header.SessionID, customPkt.Header.FragmentID, peer, echoReq.ID, echoReq.Seq)
+		s.handleDataPacket(header, payload, peer)
 	case MsgTypeEnd:
-		log.Printf("[Server] Handle END message for session %d\n", customPkt.Header.SessionID)
-		// TODO: Finalize file, close session.
-		s.sendACK(customPkt.Header.SessionID, customPkt.Header.TotalFragments, peer, echoReq.ID, echoReq.Seq) // ACK the "end" fragment
-	default:
-		log.Printf("[Server] Unknown custom packet type %d for session %d from %s\n",
-			customPkt.Header.Type, customPkt.Header.SessionID, peer.String())
+		s.handleEndPacket(header, peer)
 	}
 }
 
-// sendACK sends an ICMP Echo Reply containing our custom ACK message.
-func (s *Server) sendACK(sessionID uint32, fragmentID uint16, peer net.Addr, echoID, echoSeq int) {
-	ackHeader := CustomHeader{
-		Type:           MsgTypeACK,
-		SessionID:      sessionID,
-		FragmentID:     fragmentID,
-		TotalFragments: 0, // Not relevant for ACK
-		Checksum:       0, // ACK itself doesn't carry payload, so checksum can be 0 or calculated on header if desired.
-	}
-	ackPkt := ICMPPacket{Header: ackHeader, Payload: []byte{}} // ACK usually has no payload
-	ackBytes, err := ackPkt.Marshal()
+// 处理开始包
+func (s *Server) handleStartPacket(header *ICMPHeader, payload []byte, peer net.Addr) {
+	filename := string(payload)
+	fp := filepath.Join(s.StorageDir, filename)
+
+	// 创建文件
+	file, err := os.Create(fp)
 	if err != nil {
-		log.Printf("[Server] Error marshaling ACK packet: %v\n", err)
+		log.Printf("Failed to create file %s: %v", filename, err)
 		return
 	}
 
-	// Create an ICMP Echo Reply message.
-	// Type 0 is Echo Reply for IPv4. Code 0 is standard.
-	// The ID and Seq should typically mirror the request's ID and Seq.
-	icmpReply := icmp.Message{
-		Type: ipv4.ICMPTypeEchoReply, Code: 0,
+	session := &Session{
+		ID:         header.SessionID,
+		File:       file,
+		DataBuffer: make(map[uint16][]byte),
+		TotalSeq:   header.TotalSeq,
+		Filename:   filename,
+	}
+
+	s.Sessions.Store(header.SessionID, session)
+
+	fmt.Printf("Started receiving file: %s (total chunks: %d)\n", filename, header.TotalSeq)
+
+	// 发送ACK
+	s.sendACK(header.SessionID, header.SeqID, peer)
+}
+
+// 处理数据包
+func (s *Server) handleDataPacket(header *ICMPHeader, payload []byte, peer net.Addr) {
+	sessionInterface, ok := s.Sessions.Load(header.SessionID)
+	if !ok {
+		return
+	}
+
+	session := sessionInterface.(*Session)
+	session.Lock.Lock()
+	defer session.Lock.Unlock()
+
+	// 存储数据
+	session.DataBuffer[header.SeqID] = make([]byte, len(payload))
+	copy(session.DataBuffer[header.SeqID], payload)
+
+	// 写入连续的数据块
+	for seq := session.LastSeq + 1; seq <= header.TotalSeq; seq++ {
+		if data, exists := session.DataBuffer[seq]; exists {
+			session.File.Write(data)
+			delete(session.DataBuffer, seq)
+			session.LastSeq = seq
+		} else {
+			break
+		}
+	}
+
+	// 发送ACK
+	s.sendACK(header.SessionID, header.SeqID, peer)
+}
+
+// 处理结束包
+func (s *Server) handleEndPacket(header *ICMPHeader, peer net.Addr) {
+	sessionInterface, ok := s.Sessions.Load(header.SessionID)
+	if !ok {
+		return
+	}
+
+	session := sessionInterface.(*Session)
+	session.Lock.Lock()
+	defer session.Lock.Unlock()
+
+	// 关闭文件
+	session.File.Close()
+
+	// 清理会话
+	s.Sessions.Delete(header.SessionID)
+
+	fmt.Printf("File %s received successfully!\n", session.Filename)
+
+	// 发送ACK
+	s.sendACK(header.SessionID, header.SeqID, peer)
+}
+
+// 发送ACK
+func (s *Server) sendACK(sessionID uint32, seqID uint16, peer net.Addr) {
+	header := &ICMPHeader{
+		Type:      MsgTypeACK,
+		SessionID: sessionID,
+		SeqID:     seqID,
+		TotalSeq:  0,
+		Length:    0,
+	}
+
+	headerBytes := header.Marshal()
+
+	msg := &icmp.Message{
+		Type: ipv4.ICMPTypeEchoReply,
+		Code: 0,
 		Body: &icmp.Echo{
-			ID: echoID, Seq: echoSeq, // Mirror client's ID and Seq
-			Data: ackBytes, // Our custom ACK message as the payload
+			ID:   int(sessionID & 0xFFFF),
+			Seq:  int(seqID),
+			Data: headerBytes,
 		},
 	}
-	icmpReplyBytes, err := icmpReply.Marshal(nil)
+
+	msgBytes, err := msg.Marshal(nil)
 	if err != nil {
-		log.Printf("[Server] Error marshaling ICMP reply: %v\n", err)
+		log.Printf("Failed to marshal ACK message: %v", err)
 		return
 	}
 
-	_, err = s.Conn.WriteTo(icmpReplyBytes, peer)
-	if err != nil {
-		log.Printf("[Server] Error sending ACK to %s: %v\n", peer.String(), err)
-	} else {
-		log.Printf("[Server] Sent ACK for session %d, fragment %d to %s\n", sessionID, fragmentID, peer.String())
-	}
+	s.conn.WriteTo(msgBytes, peer)
 }
 
-// --- Main function to demonstrate client and server interaction ---
-func main() {
-	// IMPORTANT: On Linux/macOS, you need CAP_NET_RAW.
-	// Run: sudo setcap cap_net_raw+ep ./your_program_name
-	// On Windows, run as Administrator.
+// 关闭服务器
+func (s *Server) Close() error {
+	return s.conn.Close()
+}
 
+// 主函数
+func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <server|client> [server_ip_for_client]")
+		fmt.Printf("Usage:\n")
+		fmt.Printf("  Server mode: %s server [storage_dir]\n", os.Args[0])
+		fmt.Printf("  Client mode: %s client <server_ip> <file_path>\n", os.Args[0])
 		return
 	}
 
 	mode := os.Args[1]
 
-	if mode == "server" {
-		server, err := NewServer("./received_files") // Directory to store files
+	switch mode {
+	case "server":
+		storageDir := "./received_files"
+		if len(os.Args) > 2 {
+			storageDir = os.Args[2]
+		}
+
+		server, err := NewServer(storageDir)
 		if err != nil {
 			log.Fatalf("Failed to create server: %v", err)
 		}
-		defer func(Conn *icmp.PacketConn) {
-			err := Conn.Close()
-			if err != nil {
+		defer server.Close()
 
-			}
-		}(server.Conn)
-		server.Start() // This will block
-	} else if mode == "client" {
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: go run main.go client <server_ip>")
+		if err := server.Start(); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
+
+	case "client":
+		if len(os.Args) < 4 {
+			fmt.Printf("Usage: %s client <server_ip> <file_path>\n", os.Args[0])
 			return
 		}
+
 		serverIP := os.Args[2]
+		filePath := os.Args[3]
+
 		client, err := NewClient(serverIP)
 		if err != nil {
 			log.Fatalf("Failed to create client: %v", err)
 		}
 		defer client.Close()
 
-		fmt.Println("Client sending test data...")
-		testData := []byte("Hello, ICMP tunnel! This is a test message over a custom protocol.")
-		// In a real scenario, this would be a file chunk
-		err = client.SendDataPacket(1, 1, testData) // fragment 1 of 1
-		if err != nil {
-			log.Printf("Failed to send data: %v\n", err)
-		} else {
-			fmt.Println("Data sent successfully (or ACK received after retries).")
+		if err := client.SendFile(filePath); err != nil {
+			log.Fatalf("Failed to send file: %v", err)
 		}
 
-		// Keep client running briefly to receive potential delayed ACKs
-		time.Sleep(5 * time.Second)
-		fmt.Println("Client finished.")
-
-	} else {
-		fmt.Println("Invalid mode. Choose 'server' or 'client'.")
+	default:
+		fmt.Printf("Invalid mode: %s\n", mode)
+		fmt.Printf("Use 'server' or 'client'\n")
 	}
 }
